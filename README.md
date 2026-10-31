@@ -1,60 +1,140 @@
-# Railroader mod build watcher
+# Railroader Build Watcher
 
-Runs in the background from logon (windowless, via `conhost --headless`; the task re-starts it every 5 minutes if it was killed). Every 5 seconds it checks, for each watched mod, whether `<Mod>-<ver>-source.zip`
-in `Desktop\Projects` or `Downloads` has a version newer than that mod's repo.
+A Windows background script for [Railroader](https://store.steampowered.com/app/1683150/Railroader/) mod authors who
+get new versions of their mod's source as zip files (for example from an AI chat). Drop
+`<Mod>-<version>-source.zip` into a watched folder and it:
 
-Watched mods: `AutoEngineerBrakeFix` and `TrackRepair` (`-Mods` in `Watch-Builds.ps1`). For each mod:
-- the repo is `Desktop\Projects\<Mod>` (a git repo on `main`);
-- the project file is `<Mod>.csproj`;
-- it deploys to `Documents\Railroader\ModDev\<Mod>`.
+1. checks the zip,
+2. imports it into the mod's git repo as a commit,
+3. builds it against your Railroader install,
+4. pushes it to GitHub and copies the built mod into the game.
 
-To add a mod, import its first version by hand into `Desktop\Projects\<Mod>`, add the name to `-Mods` and restart
-the task.
+If the build fails and [Claude Code](https://claude.com/claude-code) is installed, a headless Claude Code session is
+allowed to try a minimal compile fix, which the script then checks for itself. Everything else runs without AI and
+costs nothing.
 
-When it finds a newer zip, it:
+## Requirements
+
+- Windows 10 or 11 with Windows PowerShell 5.1 (built in).
+- [Git for Windows](https://git-scm.com/download/win) and the [.NET SDK](https://dotnet.microsoft.com/download).
+- Railroader 0.6.0 or newer (the game's built-in mod loader).
+- Optional: [GitHub CLI](https://cli.github.com/) (`gh`), signed in, to open an issue when a build can't be fixed.
+- Optional: [Claude Code](https://claude.com/claude-code), signed in, for automatic compile fixes.
+
+## Your mod's repo
+
+Each mod lives in `<ProjectsDir>\<Mod>`. It must be:
+
+- a git repo on branch `main`, with its first version committed by hand;
+- built by `<Mod>.csproj`, with an `Info.json` that has a `"version"` field (the game's mod format);
+- optionally pushed to an `origin` remote. Without one, commits stay local.
+
+The watcher builds with:
+
+```
+dotnet build -c Release -nologo /p:RailroaderDir=<GameDir> /p:ModsDir=<ModsDir> [/p:DeployToGame=false]
+```
+
+so the csproj should reference the game's DLLs through `$(RailroaderDir)` and copy the built mod into
+`$(ModsDir)\<Mod>` after the build unless `DeployToGame` is `false`. For example:
+
+```xml
+<PropertyGroup>
+  <RailroaderDir Condition="'$(RailroaderDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Railroader</RailroaderDir>
+  <ManagedDir>$(RailroaderDir)\Railroader_Data\Managed</ManagedDir>
+  <ModsDir Condition="'$(ModsDir)' == ''">$([System.Environment]::GetFolderPath(SpecialFolder.MyDocuments))\Railroader\Mods</ModsDir>
+</PropertyGroup>
+<ItemGroup>
+  <Reference Include="$(ManagedDir)\Railroader.dll" Private="false" />
+  <Reference Include="$(ManagedDir)\Railroader.Modding.dll" Private="false" />
+  <Reference Include="$(ManagedDir)\UnityEngine.CoreModule.dll" Private="false" />
+</ItemGroup>
+<Target Name="DeployToGame" AfterTargets="Build" Condition="'$(DeployToGame)' != 'false'">
+  <Copy SourceFiles="$(OutDir)MyMod.dll;Info.json" DestinationFolder="$(ModsDir)\MyMod" />
+</Target>
+```
+
+## Setup
+
+1. Clone or download this repo anywhere.
+2. Copy `config.example.json` to `config.json` and edit it (see below).
+3. Run `powershell -ExecutionPolicy Bypass -File Install-Task.ps1`.
+
+`Install-Task.ps1` registers a scheduled task, **Railroader Build Watcher**, that starts the watcher at logon with no
+window and starts it again every 5 minutes if it was stopped. A running watcher makes the extra starts exit at once.
+After you change `config.json` or update the script, restart it (see [Commands](#commands)).
+
+### config.json
+
+Every setting is optional except `Mods`. Paths may use environment variables such as `%USERPROFILE%`. In JSON,
+backslashes must be doubled: `"C:\\Games\\Railroader"`.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `Mods` | none | Names of the mods to watch. Each one is a folder in `ProjectsDir`, a `<Mod>.csproj` and a zip prefix. |
+| `ProjectsDir` | `Desktop\Projects` | Folder that holds the mod repos. |
+| `WatchDirs` | `Desktop\Projects`, `Downloads` | Folders searched for zips. |
+| `GameDir` | Steam's default Railroader folder | The game install that the mod is compiled against. |
+| `ModsDir` | `Documents\Railroader\Mods` | Where the built mod is deployed, into `<ModsDir>\<Mod>`. |
+| `ClaudeModel` | `sonnet` | Model for the automatic compile fix. |
+
+The same names work as command-line parameters of `Watch-Builds.ps1` and override `config.json`.
+
+## What it does with a new zip
+
+Every 5 seconds it looks, for each mod, for `<Mod>-<x.y.z>-source.zip` in the watched folders with a version newer
+than the one committed in the mod's repo. It then:
 
 1. Waits until the download has finished, then checks the zip.
    - The files may sit either inside a `<Mod>/` folder or at the top level of the zip, but not both, and no deeper.
-   - Only `.cs`, `.md`, `Info.json`, the `.csproj` and `.gitignore` are allowed.
-   - `Info.json` must match the version in the file name.
-2. Refuses to build if the `.csproj` changed beyond the version number, and tells you to review it.
-3. Imports the zip into the repo as a commit (`Import v<ver> source`) and builds it. Files the zip leaves out are
-   deleted, except `.gitignore` and `CLAUDE.md`.
-4. **If it builds cleanly:** pushes to GitHub and deploys to the game. Claude is not involved and it costs nothing.
-   - A repo with no `origin` remote is committed and deployed but not pushed. You get one notification about it.
-5. **If it fails to build:** starts Claude Code (Sonnet, headless). That session can only read files, edit `.cs`
-   files and run `dotnet build`. Afterwards the script checks that only existing `.cs` files changed, and rebuilds
-   itself.
-   - Fixed: the fix is pushed as its own commit (`Fix compile errors in v<ver> (automatic)`), so Claude desktop
-     sees the exact diff. Then it deploys.
-   - Not fixed: `main` stays on the previous version and the import goes to the `incoming/v<ver>` branch. A GitHub
-     issue lists the errors and Claude's explanation.
-
-It builds for the game's own mod loader only: Railroader 0.6.0+, using `Railroader.dll` and
-`Railroader.Modding.dll`. Harmony ships with each mod, and nothing uses Unity Mod Manager. Use `-ModsDir` to deploy
-somewhere else (e.g. `...\Railroader\Mods`) and `-GameDir` for another install.
+   - Only `.cs`, `.md`, `Info.json`, `<Mod>.csproj` and `.gitignore` are allowed, up to 5 MB in total.
+   - `Info.json` and `<Mod>.csproj` must be present, and `Info.json` must match the version in the file name.
+2. Refuses to build if the `.csproj` changed beyond the version number, and tells you to review it. The csproj
+   decides what the build runs, so it is never taken from a zip unseen.
+3. Imports the zip as a commit (`Import v<ver> source`) and builds it. Files the zip leaves out are deleted from the
+   repo, except `.gitignore` and `CLAUDE.md`. If `CHANGELOG.md` has `## x.y.z` headings for skipped versions, the
+   commit message lists them.
+4. **If it builds cleanly:** pushes to GitHub and deploys to the game.
+5. **If it fails to build:** starts Claude Code headless. That session may only read files, edit `.cs` files and run
+   `dotnet build`. Afterwards the script checks that only existing `.cs` files changed, and builds again itself.
+   - Fixed: the fix is pushed as its own commit (`Fix compile errors in v<ver> (automatic)`), then it deploys.
+   - Not fixed (or Claude Code not installed): `main` stays on the previous version, the import goes to the
+     `incoming/v<ver>` branch, and a GitHub issue lists the errors and Claude's explanation.
 
 It waits instead of acting when:
-- Railroader is running (this only delays the deploy);
-- the repo has uncommitted changes;
-- the game's `Railroader.dll` or `Railroader.Modding.dll` is missing.
+- Railroader is running (this only delays the deploy, since the game locks the DLL);
+- the repo has uncommitted changes or is not on `main`;
+- the game's `Railroader.dll` or `Railroader.Modding.dll` is missing (for example during a Steam update).
 
 Every step shows a Windows notification.
 
-Old zips: after each successful import, and once per mod when the watcher starts, source zips older than the repo's
-version are moved to the Recycle Bin from `Desktop\Projects` and `Downloads`, but only if some commit on `main` has
-that version in its `Info.json` (so it is already in the repo and on GitHub). The current version's zip, any zip
-that was rejected or failed to build, and zips of versions that were never committed (from before the repo existed,
-or folded into a later import) are kept.
+**Old zips:** after each successful import, and once per mod when the watcher starts, source zips older than the
+repo's version are moved to the Recycle Bin, but only if some commit on `main` has that version in its `Info.json`.
+The current version's zip, any zip that was rejected or failed to build, and zips of versions that were never
+committed (from before the repo existed, or folded into a later import) are kept.
 
 ## Files
+
 - `Watch-Builds.ps1`: the watcher.
-- `Install-Task.ps1`: registers it as a logon task that also repeats every 5 minutes (a running watcher makes the extra starts exit at once). `Install-Task.ps1 -Remove` removes it.
-- `watcher.log`: what it did, including build errors and Claude's reports.
-- `state.json`:
-  - zips already handled (by hash), so a failed zip is not retried. Delete an entry to retry it.
-  - mods waiting to be deployed.
+- `Install-Task.ps1`: registers the scheduled task. `Install-Task.ps1 -Remove` removes it.
+- `config.example.json`: a starting point for `config.json`.
+- Created when it runs, and ignored by git:
+  - `config.json`: your settings.
+  - `watcher.log`: what it did, including build errors and Claude's reports.
+  - `state.json`: zips already handled (by hash), so a failed zip is not retried (delete its entry to retry it),
+    notifications already shown, and mods waiting to be deployed.
+  - `work\`: zips being checked.
 
 ## Commands
-- Stop it: `Stop-ScheduledTask 'AutoEngineerBrakeFix Build Watcher'`
-- Start it: `Start-ScheduledTask 'AutoEngineerBrakeFix Build Watcher'`
+
+- Stop it: `Stop-ScheduledTask 'Railroader Build Watcher'`, then end the `powershell.exe` running `Watch-Builds.ps1`
+  in Task Manager if it is still there.
+- Start it: `Start-ScheduledTask 'Railroader Build Watcher'`
+- Try a change for a few polls next to the running watcher, without deploying or opening issues:
+  `powershell -File Watch-Builds.ps1 -StateDir <empty folder> -Ticks 3 -NoDeploy -NoIssue`.
+  It still imports, commits and pushes any new zip it finds, so point `-ProjectsDir` and `-WatchDirs` at test
+  copies if that matters.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

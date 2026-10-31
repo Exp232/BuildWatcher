@@ -1,6 +1,6 @@
 # Registers the build watcher as a logon task for the current user. Run again to update it; -Remove deletes it.
 param([switch]$Remove)
-$name = 'AutoEngineerBrakeFix Build Watcher'
+$name = 'Railroader Build Watcher'
 if ($Remove) {
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $name -Confirm:$false
@@ -8,6 +8,9 @@ if ($Remove) {
     return
 }
 $script = Join-Path $PSScriptRoot 'Watch-Builds.ps1'
+if (-not (Test-Path (Join-Path $PSScriptRoot 'config.json'))) {
+    Write-Warning 'There is no config.json yet. Copy config.example.json to config.json and list your mods, or the watcher has nothing to watch.'
+}
 # conhost --headless gives PowerShell a console with no window. Launched directly, Windows 11 hands the console to
 # Windows Terminal, which ignores -WindowStyle Hidden; closing that window killed the watcher (0xC000013A).
 $action = New-ScheduledTaskAction -Execute 'conhost.exe' `

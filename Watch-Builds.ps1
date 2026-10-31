@@ -1,29 +1,60 @@
 ﻿# Railroader mod build watcher.
 # For each mod in $Mods, polls for <Mod>-<ver>-source.zip newer than that mod's repo, imports it, builds it, commits,
 # pushes and deploys it to the game. Clean builds never involve Claude. If the build fails, a headless Claude Code
-# session (Sonnet, limited to reading files, editing .cs files and running dotnet build) tries a minimal compile fix;
+# session (limited to reading files, editing .cs files and running dotnet build) tries a minimal compile fix;
 # the script then re-checks everything itself before committing. See README.md next to this file.
+#
+# Settings come from config.json next to this script (see config.example.json); parameters passed on the command
+# line override it.
 param(
     [int]$Ticks = 0,        # testing: stop after this many polls (0 = run forever)
     [switch]$NoDeploy,      # testing: skip copying into the game
     [switch]$NoIssue,       # testing: skip opening a GitHub issue
     # Each mod lives in <ProjectsDir>\<Mod>, builds <Mod>.csproj and deploys to <ModsDir>\<Mod>.
-    [string[]]$Mods    = @('AutoEngineerBrakeFix', 'TrackRepair'),
-    [string]$ProjectsDir = (Join-Path $env:USERPROFILE 'Desktop\Projects'),
-    [string[]]$WatchDirs = @((Join-Path $env:USERPROFILE 'Desktop\Projects'), (Join-Path $env:USERPROFILE 'Downloads')),
+    [string[]]$Mods    = @(),
+    [string]$ProjectsDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'),
+    [string[]]$WatchDirs = @((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'), (Join-Path $env:USERPROFILE 'Downloads')),
     [string]$GameDir   = 'C:\Program Files (x86)\Steam\steamapps\common\Railroader',  # compiled against its Managed DLLs
-    [string]$ModsDir   = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Railroader\ModDev'),  # game's mod folder to deploy into
+    [string]$ModsDir   = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Railroader\Mods'),  # game's mod folder to deploy into
+    [string]$ClaudeModel = 'sonnet',  # model for the automatic compile fix
+    [string]$ConfigFile = (Join-Path $PSScriptRoot 'config.json'),
     [string]$StateDir  = $PSScriptRoot
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
-$GitExe      = 'C:\Program Files\Git\cmd\git.exe'
-$DotnetExe   = 'C:\Program Files\dotnet\dotnet.exe'
-$GhExe       = 'C:\Program Files\GitHub CLI\gh.exe'
-$ClaudeExe   = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
-$ClaudeModel = 'sonnet'
+# config.json fills in every setting that was not passed on the command line.
+$configError = $null
+$config = $null
+if (Test-Path -LiteralPath $ConfigFile) {
+    # Backslashes in JSON paths must be doubled (C:\\Games); a mistake there is reported once the log is set up.
+    try { $config = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json }
+    catch { $configError = "config.json could not be read: $($_.Exception.Message)" }
+}
+if ($config) {
+    foreach ($key in 'Mods', 'ProjectsDir', 'WatchDirs', 'GameDir', 'ModsDir', 'ClaudeModel') {
+        $p = $config.PSObject.Properties[$key]
+        if ($p -and -not $PSBoundParameters.ContainsKey($key)) {
+            # Paths may use environment variables such as %USERPROFILE%.
+            $value = @($p.Value | ForEach-Object { [Environment]::ExpandEnvironmentVariables([string]$_) })
+            if ($key -notin 'Mods', 'WatchDirs') { $value = $value[0] }
+            Set-Variable -Name $key -Value $value
+        }
+    }
+}
+
+# Tools are looked up on PATH, then in their usual install folders. gh and claude are optional.
+function Find-Tool([string]$name, [string]$fallback) {
+    $c = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    if ($fallback -and (Test-Path -LiteralPath $fallback)) { return $fallback }
+    $null
+}
+$GitExe      = Find-Tool 'git.exe' 'C:\Program Files\Git\cmd\git.exe'
+$DotnetExe   = Find-Tool 'dotnet.exe' 'C:\Program Files\dotnet\dotnet.exe'
+$GhExe       = Find-Tool 'gh.exe' 'C:\Program Files\GitHub CLI\gh.exe'
+$ClaudeExe   = Find-Tool 'claude.exe' (Join-Path $env:USERPROFILE '.local\bin\claude.exe')
 $ClaudeTimeoutSec = 1200
 $PollSec     = 5
 
@@ -121,11 +152,6 @@ function Read-State {
     foreach ($p in 'handled', 'notified', 'pendingDeploys') {
         if (-not $s.PSObject.Properties[$p]) { $s | Add-Member $p @() }
         $s.$p = @($s.$p)
-    }
-    # Older state files had a single pendingDeploy (a version) from when only AutoEngineerBrakeFix was watched.
-    if ($s.PSObject.Properties['pendingDeploy']) {
-        if ($s.pendingDeploy) { $s.pendingDeploys = @($s.pendingDeploys) + 'AutoEngineerBrakeFix' }
-        $s.PSObject.Properties.Remove('pendingDeploy')
     }
     $s
 }
@@ -244,7 +270,7 @@ function Expand-Checked([IO.FileInfo]$zip, [string]$ver, [string]$dest) {
             $names += $name
         }
     } finally { $z.Dispose() }
-    foreach ($req in 'Info.json', "$Mod.csproj", 'Main.cs') {
+    foreach ($req in 'Info.json', "$Mod.csproj") {
         if ($names -notcontains $req) { throw "zip is missing $req" }
     }
     $infoVer = (Get-Content (Join-Path $dest 'Info.json') -Raw | ConvertFrom-Json).Version
@@ -295,7 +321,7 @@ function Invoke-ClaudeFix([string]$ver, [string]$errors) {
     $prompt = @"
 You are running unattended, started by a build watcher script. Nobody can answer questions.
 
-Version $ver of this mod was just imported into this repo (see CLAUDE.md) and does not compile.
+Version $ver of this mod was just imported into this repo (see CLAUDE.md, if there is one) and does not compile.
 Your only job: fix the compile errors with the smallest possible edits to .cs files, without changing behaviour.
 
 Rules:
@@ -313,6 +339,7 @@ Then one line per change (file, what, why) or the reason you stopped.
 Build errors:
 $errors
 "@
+    if (-not $ClaudeExe) { return "STATUS: NOT FIXED`nClaude Code (claude.exe) is not installed, so no automatic fix was tried." }
     $allowed = '"Read" "Glob" "Grep" "Edit" "Bash(dotnet build:*)" "PowerShell(dotnet build:*)"'
     $a = "-p --model $ClaudeModel --permission-mode dontAsk --permission-prompts none --allowedTools $allowed " +
          '--setting-sources project --strict-mcp-config --no-session-persistence --output-format json'
@@ -350,7 +377,7 @@ $errors
 ### Claude's report
 $report
 "@
-    if ($NoIssue -or -not (Test-HasRemote)) { Write-Log "issue skipped (-NoIssue or no GitHub remote):`n$body"; return $null }
+    if ($NoIssue -or -not $GhExe -or -not (Test-HasRemote)) { Write-Log "issue skipped (-NoIssue, no gh or no GitHub remote):`n$body"; return $null }
     $f = Join-Path $WorkDir 'issue.md'
     [IO.File]::WriteAllText($f, $body, (New-Object Text.UTF8Encoding($false)))
     $r = Invoke-Exe $GhExe "issue create --title `"v$ver does not compile`" --body-file `"$f`"" 120
@@ -417,7 +444,7 @@ function Invoke-Import($s, $cand, [string]$hash) {
         $rebuild = if ($bad.Count -eq 0) { Invoke-Build $false } else { $null }
         if ($bad.Count -eq 0 -and $rebuild.Ok -and (Get-TreeDirty) -and $report -match '(?m)^STATUS: FIXED') {
             Invoke-Git 'add -A' | Out-Null
-            $body = "Fix compile errors in v$ver (automatic)`n`n$report`n`nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
+            $body = "Fix compile errors in v$ver (automatic)`n`n$report`n`nCo-Authored-By: Claude <noreply@anthropic.com>"
             Invoke-Git "commit -q -F `"$(Write-CommitMessage $body)`"" | Out-Null
             $fixed = $true
         } else {
@@ -446,7 +473,7 @@ function Invoke-Import($s, $cand, [string]$hash) {
     Set-PendingDeploy $s $true
     Write-Log "$Mod $ver $result$(if ($fixed) { ' with an automatic compile fix' })"
     Remove-OldZips $cand.Version
-    if ($fixed) { Show-Toast "$Mod ${ver}: compile errors fixed" 'Claude fixed them. The fix is its own commit, so Claude desktop can see the diff.' }
+    if ($fixed) { Show-Toast "$Mod ${ver}: compile errors fixed" 'Claude fixed them. The fix is its own commit, so the diff is easy to review.' }
     Invoke-Deploy $s
 }
 
@@ -510,13 +537,25 @@ function Invoke-Tick {
     if ($errors.Count) { throw ($errors -join ' | ') }
 }
 
-$mutexName = 'Local\AutoEngineerBrakeFixBuildWatcher'
+$mutexName = 'Local\RailroaderBuildWatcher'
 if ($StateDir -ne $PSScriptRoot) { $mutexName += '-test' }
 $mutex = New-Object Threading.Mutex($false, $mutexName)
 # A watcher that was killed (Stop-ScheduledTask) leaves the mutex abandoned; taking it over is then fine.
 try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
 if (-not $owned) { exit }
-Write-Log "watcher started (pid $PID)"
+
+# Without these there is nothing to do. The task starts the script again every 5 minutes, so the notification is
+# shown once per problem, not every time.
+$setupProblem = if ($configError) { $configError }
+    elseif (-not $GitExe) { 'git.exe was not found. Install Git for Windows.' }
+    elseif (-not $DotnetExe) { 'dotnet.exe was not found. Install the .NET SDK.' }
+    elseif (@($Mods).Count -eq 0) { "No mods are configured. Copy config.example.json to config.json and list your mods." }
+if ($setupProblem) {
+    Write-Log "not started: $setupProblem"
+    Show-ToastOnce (Read-State) "setup-$setupProblem" 'Build watcher is not set up' $setupProblem
+    exit
+}
+Write-Log "watcher started (pid $PID, mods: $($Mods -join ', '))"
 while ($true) {
     try {
         Invoke-Tick

@@ -1,4 +1,6 @@
-# Local runtime data, not source
+# Local settings and runtime data, not source
+config.json
 state.json
 watcher.log
+watcher.log.old
 work/
