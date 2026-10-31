@@ -75,10 +75,18 @@ backslashes must be doubled: `"C:\\Games\\Railroader"`.
 | `ProjectsDir` | `Desktop\Projects` | Folder that holds the mod repos. |
 | `WatchDirs` | `Desktop\Projects`, `Downloads` | Folders searched for zips. |
 | `GameDir` | Steam's default Railroader folder | The game install that the mod is compiled against. |
-| `ModsDir` | `Documents\Railroader\Mods` | Where the built mod is deployed, into `<ModsDir>\<Mod>`. |
+| `ModsDir` | `<Railroader home>\Mods` | Where the built mod is deployed, into `<ModsDir>\<Mod>`. See below. |
 | `ClaudeModel` | `sonnet` | Model for the automatic compile fix. |
 
 The same names work as command-line parameters of `Watch-Builds.ps1` and override `config.json`.
+
+**Where mods are deployed.** Railroader loads installed mods from `<home>\Mods`, where home is `Documents\Railroader`,
+or the folder given with `-homedir` in the game's Steam launch options
+([Installing Mods](https://docs.railroadergame.com/modding/installing-mods/),
+[Command Line Arguments](https://docs.railroadergame.com/support/command-line-arguments/)). By default the watcher
+works this out the same way: it reads `-homedir` from Steam's launch options for Railroader if there is one, and
+otherwise uses `Documents\Railroader`. To deploy into the game's development folder (`<home>\ModDev`) instead, or
+anywhere else, set `ModsDir`, for example `"ModsDir": "%USERPROFILE%\\Documents\\Railroader\\ModDev"`.
 
 ## What it does with a new zip
 

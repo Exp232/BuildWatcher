@@ -15,7 +15,7 @@ param(
     [string]$ProjectsDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'),
     [string[]]$WatchDirs = @((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'), (Join-Path $env:USERPROFILE 'Downloads')),
     [string]$GameDir   = 'C:\Program Files (x86)\Steam\steamapps\common\Railroader',  # compiled against its Managed DLLs
-    [string]$ModsDir   = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Railroader\Mods'),  # game's mod folder to deploy into
+    [string]$ModsDir   = '',  # game's mod folder to deploy into; empty = <Railroader home>\Mods (see Get-RailroaderHome)
     [string]$ClaudeModel = 'sonnet',  # model for the automatic compile fix
     [string]$ConfigFile = (Join-Path $PSScriptRoot 'config.json'),
     [string]$StateDir  = $PSScriptRoot
@@ -43,6 +43,41 @@ if ($config) {
         }
     }
 }
+
+# The game's home folder, as Railroader itself resolves it (docs.railroadergame.com, "Command Line Arguments"):
+# the path after -homedir in the game's Steam launch options, otherwise Documents\Railroader. Installed mods load
+# from <home>\Mods, development packs from <home>\ModDev.
+function Get-RailroaderHome {
+    try {
+        $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath
+        $configs = Get-ChildItem -Path (Join-Path $steam 'userdata\*\config\localconfig.vdf') -ErrorAction Stop |
+            Sort-Object LastWriteTime -Descending
+        foreach ($f in $configs) {
+            $text = [IO.File]::ReadAllText($f.FullName)
+            # The app's block is "1683150" { ... }; other sections use the same key with a plain value.
+            foreach ($m in [regex]::Matches($text, '"1683150"\s*\{')) {
+                $depth = 1; $i = $m.Index + $m.Length
+                while ($i -lt $text.Length -and $depth -gt 0) {
+                    if ($text[$i] -eq '"') { $i++; while ($i -lt $text.Length -and $text[$i] -ne '"') { if ($text[$i] -eq '\') { $i++ }; $i++ } }
+                    elseif ($text[$i] -eq '{') { $depth++ }
+                    elseif ($text[$i] -eq '}') { $depth-- }
+                    $i++
+                }
+                $block = $text.Substring($m.Index, $i - $m.Index)
+                $opt = [regex]::Match($block, '"LaunchOptions"\s+"((?:[^"\\]|\\.)*)"')
+                if (-not $opt.Success) { continue }
+                $launch = [regex]::Replace($opt.Groups[1].Value, '\\(.)', '$1')
+                $h = [regex]::Match($launch,'(?i)(?:^|\s)-homedir\s+(?:"([^"]+)"|(\S+))')
+                if ($h.Success) {
+                    $path = if ($h.Groups[1].Success) { $h.Groups[1].Value } else { $h.Groups[2].Value }
+                    if ([IO.Path]::IsPathRooted($path)) { return $path }
+                }
+            }
+        }
+    } catch {}
+    Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Railroader'
+}
+if (-not $ModsDir) { $ModsDir = Join-Path (Get-RailroaderHome) 'Mods' }
 
 # Tools are looked up on PATH, then in their usual install folders. gh and claude are optional.
 function Find-Tool([string]$name, [string]$fallback) {
@@ -555,7 +590,7 @@ if ($setupProblem) {
     Show-ToastOnce (Read-State) "setup-$setupProblem" 'Build watcher is not set up' $setupProblem
     exit
 }
-Write-Log "watcher started (pid $PID, mods: $($Mods -join ', '))"
+Write-Log "watcher started (pid $PID, mods: $($Mods -join ', '); deploying to $ModsDir)"
 while ($true) {
     try {
         Invoke-Tick
