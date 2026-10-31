@@ -1,0 +1,4 @@
+# Local runtime data, not source
+state.json
+watcher.log
+work/
