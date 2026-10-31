@@ -1,4 +1,7 @@
 {
     "Mods": [ "MyMod" ],
-    "GameDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Railroader"
+    "Game": {
+        "Name": "Railroader",
+        "Dir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Railroader"
+    }
 }

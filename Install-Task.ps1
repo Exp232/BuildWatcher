@@ -1,6 +1,13 @@
 # Registers the build watcher as a logon task for the current user. Run again to update it; -Remove deletes it.
 param([switch]$Remove)
-$name = 'Railroader Build Watcher'
+$name = 'Mod Build Watcher'
+# The task's name from when the watcher was Railroader-only. It is replaced by the new one, never kept beside it.
+$oldName = 'Railroader Build Watcher'
+if (Get-ScheduledTask -TaskName $oldName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $oldName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $oldName -Confirm:$false
+    "Removed the old '$oldName' task."
+}
 if ($Remove) {
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $name -Confirm:$false
