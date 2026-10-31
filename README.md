@@ -82,6 +82,7 @@ backslashes must be doubled: `"C:\\Games\\Railroader"`.
 | `GameDir` | `Game.Dir` | The game install that the mod is compiled against. |
 | `ModsDir` | `Game.ModsDir` | Where the built mod is deployed, into `<ModsDir>\<Mod>`. See below. |
 | `ClaudeModel` | `sonnet` | Model for the automatic compile fix. |
+| `Releases` | none | Mods that get a published GitHub release after each import. See [GitHub releases](#github-releases). |
 
 The same names, except `Game`, work as command-line parameters of `Watch-Builds.ps1` and override `config.json`.
 `GameDir` and `ModsDir` also override `Game.Dir` and `Game.ModsDir`.
@@ -93,6 +94,23 @@ or the folder given with `-homedir` in the game's Steam launch options
 works this out the same way: it reads `-homedir` from Steam's launch options for Railroader if there is one, and
 otherwise uses `Documents\Railroader`. To deploy into the game's development folder (`<home>\ModDev`) instead, or
 anywhere else, set `ModsDir`, for example `"ModsDir": "%USERPROFILE%\\Documents\\Railroader\\ModDev"`.
+
+### GitHub releases
+
+For a mod listed in `Releases`, each version that builds (cleanly or after an automatic fix) and is pushed also gets a
+**published** GitHub release, created with `gh` once the push is done:
+
+- tag `v<ver>` on the commit just pushed, titled with the `name` from the version file (or the mod's folder name);
+- `<Mod>-<ver>.zip` attached: the mod built into an empty folder the same way it is deployed, so everything sits in
+  `<Mod>/`;
+- the `## <ver>` section of `CHANGELOG.md` as the notes. If the import includes skipped versions, their sections
+  are listed too, each under its own heading.
+
+This lets a workflow in the mod's repo, triggered by `release: published`, take over from there, for example to
+upload the zip to Nexus Mods. A publish starts that workflow, so every imported version goes out. If the release
+can't be created (no `gh`, or the tag already exists), the import stands and a notification says so. Workflow files
+under `.github/` are never taken from zips. Commit them by hand. Imports leave them alone, since only top-level files
+are ever removed.
 
 ### Another game
 
@@ -142,7 +160,8 @@ than the one committed in the mod's repo. It then:
 3. Imports the zip as a commit (`Import v<ver> source`) and builds it. Files the zip leaves out are deleted from the
    repo, except `.gitignore` and `CLAUDE.md`. If `CHANGELOG.md` has `## x.y.z` headings for skipped versions, the
    commit message lists them.
-4. **If it builds cleanly:** pushes to GitHub and deploys to the game.
+4. **If it builds cleanly:** pushes to GitHub, publishes a [GitHub release](#github-releases) if the mod is listed
+   in `Releases`, and deploys to the game.
 5. **If it fails to build:** starts Claude Code headless. That session may only read files, edit `.cs` files and run
    `dotnet build`. Afterwards the script checks that only existing `.cs` files changed, and builds again itself.
    - Fixed: the fix is pushed as its own commit (`Fix compile errors in v<ver> (automatic)`), then it deploys.
@@ -179,8 +198,8 @@ committed (from before the repo existed, or folded into a later import) are kept
 - Stop it: `Stop-ScheduledTask 'Mod Build Watcher'`, then end the `powershell.exe` running `Watch-Builds.ps1`
   in Task Manager if it is still there.
 - Start it: `Start-ScheduledTask 'Mod Build Watcher'`
-- Try a change for a few polls next to the running watcher, without deploying or opening issues:
-  `powershell -File Watch-Builds.ps1 -StateDir <empty folder> -Ticks 3 -NoDeploy -NoIssue`.
+- Try a change for a few polls next to the running watcher, without deploying, opening issues or releasing:
+  `powershell -File Watch-Builds.ps1 -StateDir <empty folder> -Ticks 3 -NoDeploy -NoIssue -NoRelease`.
   It still imports, commits and pushes any new zip it finds, so point `-ProjectsDir` and `-WatchDirs` at test
   copies if that matters.
 

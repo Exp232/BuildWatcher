@@ -10,8 +10,11 @@ param(
     [int]$Ticks = 0,        # testing: stop after this many polls (0 = run forever)
     [switch]$NoDeploy,      # testing: skip copying into the game
     [switch]$NoIssue,       # testing: skip opening a GitHub issue
+    [switch]$NoRelease,     # testing: skip creating GitHub releases
     # Each mod lives in <ProjectsDir>\<Mod>, builds <Mod>.csproj and deploys to <ModsDir>\<Mod>.
     [string[]]$Mods    = @(),
+    # Mods that get a published GitHub release (tag v<ver>, with <Mod>-<ver>.zip) after each successful import.
+    [string[]]$Releases = @(),
     [string]$ProjectsDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'),
     [string[]]$WatchDirs = @((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Projects'), (Join-Path $env:USERPROFILE 'Downloads')),
     [string]$GameDir   = '',  # game install compiled against; empty = Game.Dir from config.json
@@ -33,12 +36,12 @@ if (Test-Path -LiteralPath $ConfigFile) {
     catch { $configError = "config.json could not be read: $($_.Exception.Message)" }
 }
 if ($config) {
-    foreach ($key in 'Mods', 'ProjectsDir', 'WatchDirs', 'GameDir', 'ModsDir', 'ClaudeModel') {
+    foreach ($key in 'Mods', 'Releases', 'ProjectsDir', 'WatchDirs', 'GameDir', 'ModsDir', 'ClaudeModel') {
         $p = $config.PSObject.Properties[$key]
         if ($p -and -not $PSBoundParameters.ContainsKey($key)) {
             # Paths may use environment variables such as %USERPROFILE%.
             $value = @($p.Value | ForEach-Object { [Environment]::ExpandEnvironmentVariables([string]$_) })
-            if ($key -notin 'Mods', 'WatchDirs') { $value = $value[0] }
+            if ($key -notin 'Mods', 'Releases', 'WatchDirs') { $value = $value[0] }
             Set-Variable -Name $key -Value $value
         }
     }
@@ -460,6 +463,91 @@ $report
     if ($r.Code -eq 0) { $r.Out.Trim() } else { Write-Log "gh issue create failed: $($r.Err.Trim())"; $null }
 }
 
+# ---- GitHub release, for the mods listed in Releases
+
+# The CHANGELOG.md sections for the versions after $from, up to and including $to. One section is given without its
+# heading; several (versions folded into one import) keep theirs, newest first.
+function Get-ReleaseNotes([version]$from, [version]$to) {
+    $file = Join-Path $Repo 'CHANGELOG.md'
+    $sections = @()
+    $cur = $null
+    if (Test-Path -LiteralPath $file) {
+        foreach ($l in [IO.File]::ReadAllLines($file)) {
+            if ($l -match '^##\s+(\d+\.\d+\.\d+)\s*$') {
+                $v = [version]$Matches[1]
+                $cur = $null
+                if ($v -gt $from -and $v -le $to) {
+                    $cur = [pscustomobject]@{ Version = $v; Lines = New-Object Collections.Generic.List[string] }
+                    $sections += $cur
+                }
+                continue
+            }
+            if ($l -match '^#{1,2}\s') { $cur = $null; continue }
+            if ($cur) { $cur.Lines.Add($l) }
+        }
+    }
+    $sections = @($sections | Sort-Object Version -Descending)
+    if ($sections.Count -eq 0) { return "Version $to." }
+    if ($sections.Count -eq 1) { return ($sections[0].Lines -join "`n").Trim() }
+    @($sections | ForEach-Object { "## $($_.Version)`n`n" + ($_.Lines -join "`n").Trim() }) -join "`n`n"
+}
+
+# Builds the mod into an empty folder, the way it is deployed into the game, and zips that as <Mod>-<ver>.zip with
+# everything inside <Mod>/.
+function New-ReleaseZip([string]$ver) {
+    $stage = Join-Path $WorkDir "release-$Mod"
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    New-Item -ItemType Directory $stage | Out-Null
+    $r = Invoke-Exe $DotnetExe "build -c Release -nologo `"/p:$($Game.DirProperty)=$GameDir`" `"/p:ModsDir=$stage`"" 600
+    if ($r.Code -ne 0) { throw "the release build failed:`n$(Get-BuildErrors ($r.Out + "`n" + $r.Err))" }
+    $packed = Join-Path $stage $Mod
+    $v = $null
+    try { $v = Get-JsonVersion (Get-Content -LiteralPath (Join-Path $packed $Game.VersionFile) -Raw) } catch {}
+    if ($v -ne $ver) { throw "the release build did not put $($Game.VersionFile) $ver into $packed" }
+    $zip = Join-Path $WorkDir "$Mod-$ver.zip"
+    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+    # Entries are added one by one: ZipFile.CreateFromDirectory in Windows PowerShell names them with backslashes,
+    # which other tools read as flat file names.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $z = [IO.Compression.ZipFile]::Open($zip, 'Create')
+    try {
+        foreach ($f in Get-ChildItem -LiteralPath $packed -File -Recurse) {
+            $entry = "$Mod/" + ($f.FullName.Substring($packed.Length + 1) -replace '\\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $f.FullName, $entry, 'Optimal')
+        }
+    } finally { $z.Dispose() }
+    $zip
+}
+
+# Publishes release v<ver> of HEAD (already pushed) with the zip attached and the changelog as its notes. A workflow
+# in the mod's repo can take it from there, for example to upload it to Nexus Mods. A failure here is reported but
+# does not undo the import.
+function Publish-Release([version]$from, [string]$ver) {
+    if (@($Releases) -notcontains $Mod) { return }
+    if ($NoRelease) { Write-Log "release of $Mod $ver skipped (-NoRelease)"; return }
+    $tag = "v$ver"
+    try {
+        if (-not $GhExe) { throw 'gh (GitHub CLI) is not installed.' }
+        $zip = New-ReleaseZip $ver
+        $notes = Join-Path $WorkDir 'release-notes.md'
+        [IO.File]::WriteAllText($notes, (Get-ReleaseNotes $from ([version]$ver)), (New-Object Text.UTF8Encoding($false)))
+        # The title uses the mod's display name if its version file has a "name" (Railroader's Info.json does).
+        $title = "$Mod $ver"
+        try {
+            $name = (Get-Content -LiteralPath (Join-Path $Repo $Game.VersionFile) -Raw | ConvertFrom-Json).PSObject.Properties['name']
+            if ($name -and $name.Value) { $title = "$($name.Value) $ver" }
+        } catch {}
+        $sha = Invoke-Git 'rev-parse HEAD'
+        $r = Invoke-Exe $GhExe "release create $tag `"$zip`" --target $sha --title `"$($title -replace '"', '')`" --notes-file `"$notes`"" 300
+        if ($r.Code -ne 0) { throw "gh release create failed: $($r.Err.Trim()) $($r.Out.Trim())" }
+        Write-Log "$Mod $ver released as ${tag}: $($r.Out.Trim())"
+        Show-Toast "$Mod $ver released" "GitHub release $tag is published with $Mod-$ver.zip."
+    } catch {
+        Write-Log "release of $Mod $ver failed: $_"
+        Show-Toast "$Mod $ver not released" 'It is committed and pushed, but has no GitHub release. See watcher.log.'
+    }
+}
+
 # ---- one new zip, start to finish
 
 function Invoke-Import($s, $cand, [string]$hash) {
@@ -549,6 +637,7 @@ function Invoke-Import($s, $cand, [string]$hash) {
     Set-PendingDeploy $s $true
     Write-Log "$Mod $ver $result$(if ($fixed) { ' with an automatic compile fix' })"
     Remove-OldZips $cand.Version
+    if ($pushed) { Publish-Release $current $ver }
     if ($fixed) { Show-Toast "$Mod ${ver}: compile errors fixed" 'Claude fixed them. The fix is its own commit, so the diff is easy to review.' }
     Invoke-Deploy $s
 }
@@ -639,7 +728,7 @@ if ($setupProblem) {
     Show-ToastOnce (Read-State) "setup-$setupProblem" 'Build watcher is not set up' $setupProblem
     exit
 }
-Write-Log "watcher started (pid $PID, game: $($Game.Name) in $GameDir, mods: $($Mods -join ', '); deploying to $ModsDir)"
+Write-Log "watcher started (pid $PID, game: $($Game.Name) in $GameDir, mods: $($Mods -join ', ')$(if (@($Releases).Count) { "; releases: $($Releases -join ', ')" }); deploying to $ModsDir)"
 while ($true) {
     try {
         Invoke-Tick
